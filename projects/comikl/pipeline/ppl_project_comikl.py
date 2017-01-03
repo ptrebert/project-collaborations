@@ -237,10 +237,68 @@ def build_pipeline(args, config, sci_obj):
                                                   cmd, jobcall),
                          name='nuccall').mkdir(dir_nuccall)
 
+    # following tasks: bedtools/interval operations
+    dir_ivout = os.path.join(workdir, 'intervals')
+
+    cmd = config.get('Pipeline', 'mkflanks')
+    mkflanks = pipe.transform(task_func=sci_obj.get_jobf('in_out'),
+                              name='mkflanks',
+                              input=output_from(rawdata_init),
+                              filter=suffix('.txt'),
+                              output='.flanking.bed',
+                              output_dir=dir_ivout,
+                              extras=[cmd, jobcall]).mkdir(dir_ivout)
+
+    cmd = config.get('Pipeline', 'mkisect').replace('\n', ' ')
+    posisect = pipe.collate(task_func=sci_obj.get_jobf('inpair_out'),
+                            name='posisect',
+                            input=output_from(nuccall),
+                            filter=formatter('(?P<SAMPLE>\w+)(?P<REP>[0-9])\.bed'),
+                            output=os.path.join(dir_ivout, '{SAMPLE[0]}X.raw.isect.bed'),
+                            extras=[cmd, jobcall]).mkdir(dir_ivout)
+
+    cmd = config.get('Pipeline', 'mrgisect')
+    mrgisect = pipe.transform(task_func=sci_obj.get_jobf('in_out'),
+                              name='mrgisect',
+                              input=output_from(posisect),
+                              filter=suffix('.raw.isect.bed'),
+                              output='.mrg.isect.bed',
+                              output_dir=dir_ivout,
+                              extras=[cmd, jobcall])
+
+    cmd = config.get('Pipeline', 'isectovl')
+    isectovl = pipe.transform(task_func=sci_obj.get_jobf('in_out'),
+                              name='isectovl',
+                              input=output_from(mrgisect),
+                              filter=formatter(),
+                              output=os.path.join(dir_ivout, '01_HepG2_LiHG_CtX.isect.ovl.bed'),
+                              extras=[cmd, jobcall])
+
+    cmd = config.get('Pipeline', 'isectnon')
+    isectnon = pipe.transform(task_func=sci_obj.get_jobf('in_out'),
+                              name='isectnon',
+                              input=output_from(mrgisect),
+                              filter=formatter(),
+                              output=os.path.join(dir_ivout, '01_HepG2_LiHG_CtX.isect.non.bed'),
+                              extras=[cmd, jobcall])
+
+    dir_faout = os.path.join(workdir, 'fasta')
+
+    cmd = config.get('Pipeline', 'mkfasta')
+    mkfasta = pipe.transform(task_func=sci_obj.get_jobf('in_out'),
+                             name='mkfasta',
+                             input=output_from(isectovl, isectnon),
+                             filter=suffix('.bed'),
+                             output='.fa',
+                             output_dir=dir_faout,
+                             extras=[cmd, jobcall]).mkdir(dir_faout)
+
     run_comikl = pipe.merge(task_func=touch_checkfile,
                             name='run_comikl',
                             input=output_from(rawdata_init, bamfilter, bammerge,
-                                              bamidx, nucfit, nucparams, nuccall),
+                                              bamidx, nucfit, nucparams, nuccall,
+                                              mkflanks, posisect, mrgisect,
+                                              isectovl, isectnon, mkfasta),
                             output=os.path.join(workdir, 'run_project_comikl.chk'))
 
     return pipe
