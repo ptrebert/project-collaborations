@@ -1,0 +1,29 @@
+name: k122enh
+channels:
+  - bioconda
+  - r
+dependencies:
+  - openssl
+  - curl
+  - python=3.5
+  - numpy=1.11.2
+  - bedtools=2.26.0
+  - pandas=0.19
+  - pytables=3.2.3.1
+  - java-jdk
+  - samtools=1.3.1
+  - deeptools=2.4.*
+  - r-base=3.3.*
+  - r-openssl
+  - r-curl
+  - r-devtools
+  - bioconductor-biostrings
+  - bioconductor-genomicranges
+  - bioconductor-iranges
+  - bioconductor-edger
+  - bioconductor-biocinstaller
+  - macs2=2.1.1
+
+
+  # install EpiCSeg: https://github.com/lamortenera/epicseg
+  # install TEPIC: https://github.com/SchulzLab/TEPIC
