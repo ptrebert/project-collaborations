@@ -117,6 +117,8 @@ def collect_fitpars_results(inputfiles, outputfile, regexp):
         with open(outputfile, 'r') as inf:
             old_params = js.load(inf)
         overwrite = old_params != params
+    else:
+        overwrite = True
     if overwrite:
         with open(outputfile, 'w') as outf:
             js.dump(params, outf, indent=1, sort_keys=True)
