@@ -393,7 +393,7 @@ def build_pipeline(args, config, sci_obj):
                              output=os.path.join(dir_epicseg, '{SAMPLE[0]}_segmentation.bed'),
                              extras=[cmd, jobcall]).mkdir(dir_epicseg)
 
-    sci_obj.set_config_env(dict(config.items('MemJobConfig')), dict(config.items('EnvConfig')))
+    sci_obj.set_config_env(dict(config.items('MemJobConfig')), dict(config.items('EnvConfigMacs')))
     if args.gridmode:
         jobcall = sci_obj.ruffus_gridjob()
     else:
@@ -401,7 +401,7 @@ def build_pipeline(args, config, sci_obj):
 
     # perform DNase peak calling with MACS2
     dir_callpeaks = os.path.join(workdir, 'macs2', 'peaks')
-    cmd = config.get('Pipeline', 'dnasepeak')
+    cmd = config.get('Pipeline', 'dnasepeak').replace('\n', ' ')
     dnasepeak = pipe.transform(task_func=sci_obj.get_jobf('in_out'),
                                name='dnasepeak',
                                input=output_from(bamsample),
