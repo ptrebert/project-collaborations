@@ -79,8 +79,15 @@ def collect_fitpars_results(inputfiles, outputfile, regexp):
     for k, sig in sigmas.items():
         s = int(stat.median(sig))
         params[k + '_sigma'] = s
-    with open(outputfile, 'w') as outf:
-        js.dump(params, outf, indent=1, sort_keys=True)
+    if os.path.isfile(outputfile):
+        with open(outputfile, 'r') as inf:
+            old_params = js.load(inf)
+        overwrite = old_params != params
+    else:
+        overwrite = True
+    if overwrite:
+        with open(outputfile, 'w') as outf:
+            js.dump(params, outf, indent=1, sort_keys=True)
     return outputfile
 
 
@@ -114,7 +121,10 @@ def build_callnucs_arguments(bamfiles, paramfile, outdir, cmd, jobcall):
     :param jobcall:
     :return:
     """
-    params = js.load(open(paramfile, 'r'))
+    try:
+        params = js.load(open(paramfile, 'r'))
+    except FileNotFoundError:
+        return []
     samples = params['samples']
     arglist = []
     for smp in samples:
@@ -160,6 +170,14 @@ def build_pipeline(args, config, sci_obj):
                                   name='init',
                                   output=collect_full_paths(dir_rawdata, '*'))
 
+    cmd = config.get('Pipeline', 'cleangenome')
+    cleangenome = pipe.transform(task_func=sci_obj.get_jobf('in_out'),
+                                 name='cleangenome',
+                                 input=config.get('Refdata', 'chromreg'),
+                                 filter=formatter(),
+                                 output=config.get('Refdata', 'cleanreg'),
+                                 extras=[cmd, jobcall]).follows(rawdata_init)
+
     dir_filtered = os.path.join(workdir, 'filtered')
     cmd = config.get('Pipeline', 'bamfilt')
     bamfilter = pipe.transform(task_func=sci_obj.get_jobf('in_out'),
@@ -168,23 +186,7 @@ def build_pipeline(args, config, sci_obj):
                                filter=suffix('.bam'),
                                output='.filt.bam',
                                output_dir=dir_filtered,
-                               extras=[cmd, jobcall]).mkdir(dir_filtered)
-
-    sci_obj.set_config_env(dict(config.items('ParallelJobConfig')), dict(config.items('EnvConfig')))
-    if args.gridmode:
-        jobcall = sci_obj.ruffus_gridjob()
-    else:
-        jobcall = sci_obj.ruffus_localjob()
-
-    # 01_HepG2_LiHG_Ct1_Input_S_1.bwa.20150122.filt.bam
-    # 01_HepG2_LiHG_Ct1_Input_S_2.bwa.20150120.filt.bam
-    cmd = config.get('Pipeline', 'bammerge')
-    bammerge = pipe.collate(task_func=sci_obj.get_jobf('ins_out'),
-                            name='bammerge',
-                            input=output_from(bamfilter),
-                            filter=formatter('(?P<SAMPLE>\w+_Input_S)_(?P<REP>[0-9]+)\.bwa\.(?P<DATE>[0-9]+)\.(?P<EXT>[\w\.]+)'),
-                            output=os.path.join(dir_filtered, '{SAMPLE[0]}_N.mrg.20161219.{EXT[0]}'),
-                            extras=[cmd, jobcall])
+                               extras=[cmd, jobcall]).mkdir(dir_filtered).follows(cleangenome)
 
     sci_obj.set_config_env(dict(config.items('JobConfig')), dict(config.items('EnvConfig')))
     if args.gridmode:
@@ -195,7 +197,7 @@ def build_pipeline(args, config, sci_obj):
     cmd = config.get('Pipeline', 'bamidx')
     bamidx = pipe.transform(task_func=sci_obj.get_jobf('in_out'),
                             name='bamidx',
-                            input=output_from(bamfilter, bammerge),
+                            input=output_from(bamfilter),
                             filter=suffix('.bam'),
                             output='.bai',
                             output_dir=dir_filtered,
@@ -208,13 +210,13 @@ def build_pipeline(args, config, sci_obj):
         jobcall = sci_obj.ruffus_localjob()
 
     cmd = config.get('Pipeline', 'nucfit')
-    dir_nucfit = os.path.join(workdir, 'nucfit')
+    dir_nucfit = os.path.join(workdir, 'nuchunter', 'fit')
     nucfit = pipe.transform(task_func=sci_obj.get_jobf('in_out'),
                             name='nucfit',
-                            input=output_from(bammerge, bamfilter),
+                            input=output_from(bamfilter),
                             filter=formatter('(?P<SAMPLE>\w+)\.(?P<EXT>[\w\.]+)\.bam$'),
                             output=os.path.join(dir_nucfit, '{SAMPLE[0]}.dat'),
-                            extras=[cmd, jobcall]).mkdir(dir_nucfit)
+                            extras=[cmd, jobcall]).mkdir(dir_nucfit).follows(bamidx)
 
     nucparams = pipe.merge(task_func=collect_fitpars_results,
                            name='nucparams',
@@ -229,16 +231,87 @@ def build_pipeline(args, config, sci_obj):
         jobcall = sci_obj.ruffus_localjob()
 
     cmd = config.get('Pipeline', 'nuccall')
-    dir_nuccall = os.path.join(workdir, 'nuccall')
+    dir_nuccall = os.path.join(workdir, 'nuchunter', 'call')
     nuccall = pipe.files(sci_obj.get_jobf('ins_out'),
                          build_callnucs_arguments(collect_full_paths(dir_filtered, '*.bam'),
                                                   os.path.join(dir_nucfit, 'sigma_fraglen_params.json'),
                                                   dir_nuccall,
                                                   cmd, jobcall),
-                         name='nuccall').mkdir(dir_nuccall)
+                         name='nuccall').mkdir(dir_nuccall).follows(nucparams)
+
+    sci_obj.set_config_env(dict(config.items('JobConfig')), dict(config.items('EnvConfig')))
+    if args.gridmode:
+        jobcall = sci_obj.ruffus_gridjob()
+    else:
+        jobcall = sci_obj.ruffus_localjob()
+
+    dir_procdata = os.path.join(workdir, 'procdata')
+    cmd = config.get('Pipeline', 'convhg19')
+    convpeaks = pipe.transform(task_func=sci_obj.get_jobf('in_out'),
+                               name='convpeaks',
+                               input=output_from(rawdata_init),
+                               filter=suffix('Intersection_ATAC_DNase_NOMe_HepG2_MACS.txt'),
+                               output='triOpen_HepG2_hg19.bed',
+                               output_dir=dir_procdata,
+                               extras=[cmd, jobcall]).mkdir(dir_procdata)
+
+    cmd = config.get('Pipeline', 'openprox')
+    openprox = pipe.transform(task_func=sci_obj.get_jobf('in_out'),
+                              name='openprox',
+                              input=output_from(convpeaks),
+                              filter=suffix('.bed'),
+                              output='_prox_prom.bed',
+                              output_dir=dir_procdata,
+                              extras=[cmd, jobcall])
+
+    cmd = config.get('Pipeline', 'opendist')
+    opendist = pipe.transform(task_func=sci_obj.get_jobf('in_out'),
+                              name='opendist',
+                              input=output_from(convpeaks),
+                              filter=suffix('.bed'),
+                              output='_dist_prom.bed',
+                              output_dir=dir_procdata,
+                              extras=[cmd, jobcall])
+
+    cmd = config.get('Pipeline', 'uniqprox')
+    uniqprox = pipe.transform(task_func=sci_obj.get_jobf('in_out'),
+                              name='uniqprox',
+                              input=output_from(openprox),
+                              filter=formatter(),
+                              output=os.path.join(dir_procdata, '{basename[0]}.uniq.bed'),
+                              extras=[cmd, jobcall])
+
+    cmd = config.get('Pipeline', 'uniqdist')
+    uniqdist = pipe.transform(task_func=sci_obj.get_jobf('in_out'),
+                              name='uniqdist',
+                              input=output_from(opendist),
+                              filter=formatter(),
+                              output=os.path.join(dir_procdata, '{basename[0]}.uniq.bed'),
+                              extras=[cmd, jobcall])
+
+    dir_fasta = os.path.join(workdir, 'fasta')
+    cmd = config.get('Pipeline', 'mkfasta')
+    promfasta = pipe.transform(task_func=sci_obj.get_jobf('in_out'),
+                               name='promfasta',
+                               input=output_from(uniqdist, uniqprox),
+                               filter=suffix('.bed'),
+                               output='.fa',
+                               output_dir=dir_fasta,
+                               extras=[cmd, jobcall]).mkdir(dir_fasta)
+
+    run_comikl = pipe.merge(task_func=touch_checkfile,
+                            name='run_comikl',
+                            input=output_from(rawdata_init, cleangenome, bamfilter,
+                                              bamidx, nucfit, nucparams, nuccall,
+                                              convpeaks, openprox, opendist,
+                                              uniqdist, uniqprox, promfasta),
+                            output=os.path.join(workdir, 'run_project_comikl.chk'))
+
+    # =====================
+    # Tasks below likely outdated, just kept for reference
 
     # following tasks: bedtools/interval operations
-    dir_ivout = os.path.join(workdir, 'intervals')
+    dir_ivout = os.path.join(workdir, 'bedtools', 'intervals')
 
     cmd = config.get('Pipeline', 'mkflanks')
     mkflanks = pipe.transform(task_func=sci_obj.get_jobf('in_out'),
@@ -292,13 +365,5 @@ def build_pipeline(args, config, sci_obj):
                              output='.fa',
                              output_dir=dir_faout,
                              extras=[cmd, jobcall]).mkdir(dir_faout)
-
-    run_comikl = pipe.merge(task_func=touch_checkfile,
-                            name='run_comikl',
-                            input=output_from(rawdata_init, bamfilter, bammerge,
-                                              bamidx, nucfit, nucparams, nuccall,
-                                              mkflanks, posisect, mrgisect,
-                                              isectovl, isectnon, mkfasta),
-                            output=os.path.join(workdir, 'run_project_comikl.chk'))
 
     return pipe
