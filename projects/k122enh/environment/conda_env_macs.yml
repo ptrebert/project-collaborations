@@ -6,6 +6,3 @@ dependencies:
   - numpy=1.11.2
   - macs2=2.1.1
 
-
-  # install EpiCSeg: https://github.com/lamortenera/epicseg
-  # install TEPIC: https://github.com/SchulzLab/TEPIC

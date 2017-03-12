@@ -22,8 +22,6 @@ dependencies:
   - bioconductor-iranges
   - bioconductor-edger
   - bioconductor-biocinstaller
-  - macs2=2.1.1
-
 
   # install EpiCSeg: https://github.com/lamortenera/epicseg
   # install TEPIC: https://github.com/SchulzLab/TEPIC
