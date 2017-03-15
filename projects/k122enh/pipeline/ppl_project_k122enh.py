@@ -419,13 +419,36 @@ def build_pipeline(args, config, sci_obj):
                               output='.ncbi.bed',
                               output_dir=dir_convncbi).mkdir(dir_convncbi)
 
+    convpeaks = pipe.transform(task_func=convert_to_ncbi,
+                               name='convpeaks',
+                               input=output_from(dnasepeak),
+                               filter=suffix('.narrowPeak'),
+                               output='.bed',
+                               output_dir=dir_convncbi)
+
+    sci_obj.set_config_env(dict(config.items('JobConfig')), dict(config.items('EnvConfig')))
+    if args.gridmode:
+        jobcall = sci_obj.ruffus_gridjob()
+    else:
+        jobcall = sci_obj.ruffus_localjob()
+
+    dir_epicrep = os.path.join(workdir, 'epicseg', 'report')
+    cmd = config.get('Pipeline', 'epicrep').replace('\n', ' ')
+    epicrep = pipe.transform(task_func=sci_obj.get_jobf('in_out'),
+                             name='epicrep',
+                             input=output_from(convncbi),
+                             filter=formatter('(?P<SAMPLE>\w+)_segmentation\.ncbi\.bed'),
+                             output=os.path.join(dir_epicrep, '{SAMPLE[0]}_report.html'),
+                             extras=[cmd, jobcall]).mkdir(dir_epicrep).follows(convpeaks)
+
     run_k122enh = pipe.merge(task_func=touch_checkfile,
                              name='run_k122enh',
                              input=output_from(rawdata_init, bamfilter, bammerge,
                                                bamidx, nucfit, nucparams, nuccall,
                                                epiccount, epicnorm, epicseg,
                                                convncbi, cleangenome, countreads,
-                                               countmerged, dnasepeak),
+                                               countmerged, dnasepeak, convpeaks,
+                                               epicrep),
                              output=os.path.join(workdir, 'run_project_k122enh.chk'))
 
     return pipe
