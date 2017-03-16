@@ -318,7 +318,7 @@ def main():
                                    scoring='average_precision',
                                    n_jobs=15, pre_dispatch=15, cv=10, refit=True)
         cvgrid.fit(x_train, y_train)
-        probs = cvgrid.predict_proba(x_test, y_test)
+        probs = cvgrid.predict_proba(x_test)
         score = cvgrid.score(x_test, y_test)
         print('Run {} finished: {}'.format(idx, ti.ctime()))
         print(score)
