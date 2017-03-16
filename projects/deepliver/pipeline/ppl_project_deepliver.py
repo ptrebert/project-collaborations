@@ -4,6 +4,7 @@ import os as os
 import datetime as dt
 import fnmatch as fnm
 import re as re
+import shutil as sh
 import csv as csv
 import json as js
 import statistics as stat
@@ -40,6 +41,30 @@ def collect_full_paths(rootdir, pattern):
     return all_files
 
 
+def copy_input_files(rootpaths, destdir):
+    """
+    :param rootpaths:
+    :return:
+    """
+    if not os.path.isdir(destdir):
+        os.makedirs(destdir, exist_ok=True)
+    to_copy = []
+    for fp in rootpaths:
+        for root, dirs, files in os.walk(fp):
+            if files:
+                selected = fnm.filter(files, '*DNase*.nodup.blfilt.bamcov.bw')
+                for s in selected:
+                    to_copy.append(os.path.join(root, s))
+    assert to_copy, 'No input files found'
+    copied = []
+    for fp in to_copy:
+        dest = os.path.join(destdir, os.path.basename(fp))
+        if not os.path.isfile(dest):
+            sh.copy(fp, dest)
+        copied.append(dest)
+    return copied
+
+
 def load_chromosomes(fpath):
     """
     :param fpath:
@@ -62,95 +87,11 @@ def symm_filter_chainfile(inputfile, outpattern, chromsizes, cmd, jobcall):
     arglist = []
     chromosomes = sorted(load_chromosomes(chromsizes).keys())
     for c in chromosomes:
-        c_out = outpattern.format(c)
-        tmp = cmd.format(**{'chrom': c})
+        strfmt = {'chrom': c}
+        c_out = outpattern.format(**strfmt)
+        tmp = cmd.format(**strfmt)
         arglist.append([inputfile, c_out, tmp, jobcall])
     return arglist
-
-
-def set_sample_fraction(mergefiles, outbase, cmd, jobcall):
-    """
-    :param mergefiles:
-    :param outbase:
-    :param cmd:
-    :param jobcall:
-    :return:
-    """
-    # for narrow marks: ~40m reads (like H3K122ac); H3K4me1 a little more
-    # for broad marks: ~60m reads
-    # for Input: ~100m reads
-    # DNase: ~200m reads
-    fractions = {'Input': '-s 0.63', 'H3K122ac': '', 'H3K27ac': '-s 0.31',
-                 'H3K4me3': '-s 0.84', 'H3K4me1': '-s 0.45',
-                 'H3K27me3': '-s 0.32', 'H3K36me3': '-s 0.28',
-                 'H3K9me3': '-s 0.31', 'DNase': '-s 0.52'}
-    arglist = []
-    for mrgf in mergefiles:
-        lib = os.path.basename(mrgf).split('.')[0].split('_')[-1]
-        prefix = 'TMP_' + lib
-        frac = fractions[lib]
-        tmp = cmd.format(**{'fraction': frac, 'prefix': prefix})
-        outname = os.path.basename(mrgf).split('.')[0] + '.sort.bam'
-        outfile = os.path.join(outbase, outname)
-        arglist.append([mrgf, outfile, tmp, jobcall])
-    if mergefiles:
-        assert arglist, 'No arguments for BAM sampling created'
-    return arglist
-
-
-def extract_sigma_flen(fpath):
-    """
-    :return:
-    """
-    sigma, mu, auc = 0, 0, 0
-    with open(fpath, 'r', newline='') as datfile:
-        rows = csv.DictReader(datfile, delimiter='\t')
-        for r in rows:
-            if float(r['auc']) > auc:
-                auc = float(r['auc'])
-                sigma = float(r['t-sigma'])
-                mu = float(r['mu'])
-    assert sigma > 0 and mu > 0, 'NucHunter dat file Parsing failed: {}'.format(fpath)
-    return sigma, int(mu)
-
-
-def collect_fitpars_results(inputfiles, outputfile, regexp):
-    """
-    :param inputfiles:
-    :param outputfile:
-    :param regexp:
-    :return:
-    """
-    params = dict()
-    sigmas = col.defaultdict(list)
-    matcher = re.compile(regexp)
-    if not inputfiles:
-        return ''
-    for inpf in inputfiles:
-        fp, fn = os.path.split(inpf)
-        mobj = matcher.match(fn)
-        assert mobj is not None, 'Unexpected file: {}'.format(inpf)
-        sample, lib = mobj.group('SAMPLE'), mobj.group('LIB')
-        if not lib.startswith('H3K'):
-            continue
-        sigma, flen = extract_sigma_flen(inpf)
-        sigmas[sample].append(sigma)
-        params[sample + '_' + lib] = flen
-    params['samples'] = list(sigmas.keys())
-    for k, sig in sigmas.items():
-        s = round(stat.median(sig))
-        params[k + '_sigma'] = s
-    overwrite = False
-    if os.path.isfile(outputfile):
-        with open(outputfile, 'r') as inf:
-            old_params = js.load(inf)
-        overwrite = old_params != params
-    else:
-        overwrite = True
-    if overwrite:
-        with open(outputfile, 'w') as outf:
-            js.dump(params, outf, indent=1, sort_keys=True)
-    return outputfile
 
 
 def filter_bamfiles(bams, sample):
@@ -270,190 +211,222 @@ def build_pipeline(args, config, sci_obj):
     else:
         jobcall = sci_obj.ruffus_localjob()
 
-    dir_rawdata = os.path.join(workdir, 'rawdata')
-    rawdata_init = pipe.originate(task_func=lambda x: x,
-                                  name='init',
-                                  output=collect_full_paths(dir_rawdata, '*'))
+    dir_chainfile = os.path.join(workdir, 'chain')
+    chainfile_init = pipe.originate(task_func=lambda x: x,
+                                    name='chainfile_init',
+                                    output=collect_full_paths(dir_chainfile, '*.chain.gz'))
 
-    cmd = config.get('Pipeline', 'cleangenome')
-    cleangenome = pipe.transform(task_func=sci_obj.get_jobf('in_out'),
-                                 name='cleangenome',
-                                 input=config.get('Refdata', 'chromreg'),
-                                 filter=formatter(),
-                                 output=config.get('Refdata', 'cleanreg'),
-                                 extras=[cmd, jobcall]).follows(rawdata_init)
+    dir_chain_temp = os.path.join(dir_chainfile, 'temp')
+    cmd = config.get('Pipeline', 'symmfilt')
+    params_symm_filter = symm_filter_chainfile(os.path.join(dir_chainfile, 'hg19.mm10.rbest.chain.gz'),
+                                               os.path.join(dir_chain_temp, 'hg19_to_mm10.{chrom}.symm.tsv.gz'),
+                                               os.path.join(config.get('Refdata', 'chromsizes'), 'mm10_chrom_augo.tsv'),
+                                               cmd, jobcall)
 
-    dir_filtered = os.path.join(workdir, 'filtered')
-    cmd = config.get('Pipeline', 'bamfilt')
-    bamfilter = pipe.transform(task_func=sci_obj.get_jobf('in_out'),
-                               name='bamfilter',
-                               input=output_from(rawdata_init),
-                               filter=suffix('.bam'),
-                               output='.filt.bam',
-                               output_dir=dir_filtered,
-                               extras=[cmd, jobcall]).mkdir(dir_filtered).follows(cleangenome)
+    chain_symm_filt = pipe.files(sci_obj.get_jobf('in_out'),
+                                 params_symm_filter,
+                                 name='chain_symm_filt')
+    chain_symm_filt = chain_symm_filt.mkdir(dir_chain_temp)
+    chain_symm_filt = chain_symm_filt.follows(chainfile_init)
 
-    cmd = config.get('Pipeline', 'countreads')
-    countreads = pipe.transform(task_func=sci_obj.get_jobf('in_out'),
-                                name='countreads',
-                                input=output_from(bamfilter),
-                                filter=suffix('.filt.bam'),
-                                output='.filt.cnt',
-                                output_dir=dir_filtered,
+    cmd = config.get('Pipeline', 'mrgblocks')
+    chain_symm_merge = pipe.merge(task_func=sci_obj.get_jobf('ins_out'),
+                                  name='chain_symm_merge',
+                                  input=output_from(chain_symm_filt),
+                                  output=os.path.join(dir_chain_temp, 'hg19_to_mm10.wg.symm.tsv.gz'),
+                                  extras=[cmd, jobcall])
+
+    cmd = config.get('Pipeline', 'normblocks')
+    chain_norm_filt = pipe.transform(task_func=sci_obj.get_jobf('in_out'),
+                                     name='chain_norm_filt',
+                                     input=output_from(chain_symm_merge),
+                                     filter=suffix('wg.symm.tsv.gz'),
+                                     output='150.symm.tsv.gz',
+                                     output_dir=dir_chainfile,
+                                     extras=[cmd, jobcall])
+
+    cmd = config.get('Pipeline', 'hsa_blocks')
+    hsa_blocks = pipe.transform(task_func=sci_obj.get_jobf('in_out'),
+                                name='hsa_blocks',
+                                input=output_from(chain_norm_filt),
+                                filter=suffix('symm.tsv.gz'),
+                                output='hsa_blocks.bed',
+                                output_dir=dir_chainfile,
                                 extras=[cmd, jobcall])
 
-    sci_obj.set_config_env(dict(config.items('ParallelJobConfig')), dict(config.items('EnvConfig')))
-    if args.gridmode:
-        jobcall = sci_obj.ruffus_gridjob()
-    else:
-        jobcall = sci_obj.ruffus_localjob()
+    cmd = config.get('Pipeline', 'mmu_blocks')
+    mmu_blocks = pipe.transform(task_func=sci_obj.get_jobf('in_out'),
+                                name='mmu_blocks',
+                                input=output_from(chain_norm_filt),
+                                filter=suffix('symm.tsv.gz'),
+                                output='mmu_blocks.bed',
+                                output_dir=dir_chainfile,
+                                extras=[cmd, jobcall])
 
-    # 01_HepG2_LiHG_Ct1_Input_S_1.bwa.20150122.filt.bam
-    # 01_HepG2_LiHG_Ct1_Input_S_2.bwa.20150120.filt.bam
-    dir_bammerge = os.path.join(workdir, 'merged')
-    cmd = config.get('Pipeline', 'bammerge')
-    bammerge = pipe.collate(task_func=sci_obj.get_jobf('ins_out'),
-                            name='bammerge',
-                            input=output_from(bamfilter),
-                            filter=formatter('(?P<BIOSAMPLE>\w+)_(?P<REP>Ct[0-9])_(?P<MARK>\w+)_(?P<CENTER>(S|F)_(1|2)).+\.filt\.bam'),
-                            output=os.path.join(dir_bammerge, '{BIOSAMPLE[0]}_{MARK[0]}.mrg.bam'),
-                            extras=[cmd, jobcall]).mkdir(dir_bammerge)
+    # ============================
+    # start processing DNase data
 
-    sci_obj.set_config_env(dict(config.items('JobConfig')), dict(config.items('EnvConfig')))
-    if args.gridmode:
-        jobcall = sci_obj.ruffus_gridjob()
-    else:
-        jobcall = sci_obj.ruffus_localjob()
+    dir_dnase_input = os.path.join(workdir, 'input')
 
-    cmd = config.get('Pipeline', 'countreads')
-    countmerged = pipe.transform(task_func=sci_obj.get_jobf('in_out'),
-                                 name='countmerged',
-                                 input=output_from(bammerge),
-                                 filter=suffix('.mrg.bam'),
-                                 output='.mrg.cnt',
-                                 output_dir=dir_bammerge,
-                                 extras=[cmd, jobcall])
+    dnase_input = copy_input_files([config.get('DataSource', 'human'),
+                                    config.get('DataSource', 'mouse')],
+                                   dir_dnase_input)
 
-    sci_obj.set_config_env(dict(config.items('ParallelJobConfig')), dict(config.items('EnvConfig')))
-    if args.gridmode:
-        jobcall = sci_obj.ruffus_gridjob()
-    else:
-        jobcall = sci_obj.ruffus_localjob()
+    dnase_init = pipe.originate(task_func=lambda x: x,
+                                name='dnase_init',
+                                output=dnase_input)
 
-    dir_bamsample = os.path.join(workdir, 'sampled')
-    cmd = config.get('Pipeline', 'bamsample')
-    merged_bam_files = collect_full_paths(dir_bammerge, '*.mrg.bam')
-    params = set_sample_fraction(merged_bam_files, dir_bamsample, cmd, jobcall)
-    bamsample = pipe.files(sci_obj.get_jobf('in_out'),
-                           params,
-                           name='bamsample').follows(bammerge).active_if(len(merged_bam_files) > 0).mkdir(dir_bamsample)
+    dir_dnase_bg = os.path.join(workdir, 'bedgraph')
+    cmd = config.get('Pipeline', 'bwtobg')
+    dnase_bwtobg = pipe.transform(task_func=sci_obj.get_jobf('in_out'),
+                                  name='dnase_bwtobg',
+                                  input=output_from(dnase_init),
+                                  filter=formatter('41_(?P<SAMPLE>\w+)_DNase_S_.+\.bw'),
+                                  output=os.path.join(dir_dnase_bg, '{SAMPLE[0]}.bg.gz'),
+                                  extras=[cmd, jobcall])
+    dnase_bwtobg = dnase_bwtobg.mkdir(dir_dnase_bg)
 
-    sci_obj.set_config_env(dict(config.items('JobConfig')), dict(config.items('EnvConfig')))
-    if args.gridmode:
-        jobcall = sci_obj.ruffus_gridjob()
-    else:
-        jobcall = sci_obj.ruffus_localjob()
+    dir_dnase_scores = os.path.join(workdir, 'scores')
+    cmd = config.get('Pipeline', 'hsa_scores')
+    hsa_scores = pipe.transform(task_func=sci_obj.get_jobf('in_out'),
+                                name='hsa_scores',
+                                input=output_from(dnase_bwtobg),
+                                filter=formatter('(?P<SAMPLE>H(f|m)\w+)\.bg\.gz'),
+                                output=os.path.join(dir_dnase_scores, '{SAMPLE[0]}.meansig.tsv'),
+                                extras=[cmd, jobcall])
+    hsa_scores = hsa_scores.mkdir(dir_dnase_scores)
+    hsa_scores = hsa_scores.follows(hsa_blocks)
 
-    cmd = config.get('Pipeline', 'bamidx')
-    bamidx = pipe.transform(task_func=sci_obj.get_jobf('in_out'),
-                            name='bamidx',
-                            input=output_from(bamsample),
-                            filter=suffix('.bam'),
-                            output='.bai',
-                            output_dir=dir_bamsample,
-                            extras=[cmd, jobcall])
+    cmd = config.get('Pipeline', 'mmu_scores')
+    mmu_scores = pipe.transform(task_func=sci_obj.get_jobf('in_out'),
+                                name='mmu_scores',
+                                input=output_from(dnase_bwtobg),
+                                filter=formatter('(?P<SAMPLE>M(f|m)\w+)\.bg\.gz'),
+                                output=os.path.join(dir_dnase_scores, '{SAMPLE[0]}.meansig.tsv'),
+                                extras=[cmd, jobcall])
+    mmu_scores = mmu_scores.mkdir(dir_dnase_scores)
+    mmu_scores = mmu_scores.follows(mmu_blocks)
 
-    sci_obj.set_config_env(dict(config.items('ParallelJobConfig')), dict(config.items('EnvConfig')))
-    if args.gridmode:
-        jobcall = sci_obj.ruffus_gridjob()
-    else:
-        jobcall = sci_obj.ruffus_localjob()
-
-    cmd = config.get('Pipeline', 'nucfit')
-    dir_nucfit = os.path.join(workdir, 'nuchunter', 'fit')
-    nucfit = pipe.transform(task_func=sci_obj.get_jobf('in_out'),
-                            name='nucfit',
-                            input=output_from(bamsample),
-                            filter=formatter('(?P<SAMPLE>\w+H3K[a-z0-9]+)\.(?P<EXT>[\w\.]+)\.bam$'),
-                            output=os.path.join(dir_nucfit, '{SAMPLE[0]}.dat'),
-                            extras=[cmd, jobcall]).mkdir(dir_nucfit).follows(bamidx)
-
-    nucparams = pipe.merge(task_func=collect_fitpars_results,
-                           name='nucparams',
-                           input=output_from(nucfit),
-                           output=os.path.join(dir_nucfit, 'sigma_fraglen_params.json'),
-                           extras=['(?P<SAMPLE>\w+)_(?P<LIB>[A-Za-z0-9]+)\.dat'])
-
-    sci_obj.set_config_env(dict(config.items('NodeJobConfig')), dict(config.items('EnvConfig')))
-    if args.gridmode:
-        jobcall = sci_obj.ruffus_gridjob()
-    else:
-        jobcall = sci_obj.ruffus_localjob()
-
-    cmd = config.get('Pipeline', 'nuccall')
-    dir_nuccall = os.path.join(workdir, 'nuchunter', 'call')
-    nuccall = pipe.files(sci_obj.get_jobf('ins_out'),
-                         build_callnucs_arguments(collect_full_paths(dir_bamsample, '*.bam'),
-                                                  os.path.join(dir_nucfit, 'sigma_fraglen_params.json'),
-                                                  dir_nuccall,
-                                                  cmd, jobcall),
-                         name='nuccall').mkdir(dir_nuccall).active_if(os.path.isfile(os.path.join(dir_nucfit, 'sigma_fraglen_params.json')))
-
-    cmd = config.get('Pipeline', 'epiccount').replace('\n', ' ')
-    dir_epiccount = os.path.join(workdir, 'epicseg', 'counts')
-    epiccount = pipe.files(sci_obj.get_jobf('ins_out'),
-                           build_epiccount_arguments(collect_full_paths(dir_bamsample, '*.bam'),
-                                                     dir_epiccount, cmd, jobcall)).mkdir(dir_epiccount).follows(bamsample)
-
-    cmd = config.get('Pipeline', 'epicnorm')
-    epicnorm = pipe.transform(task_func=sci_obj.get_jobf('in_out'),
-                              name='epicnorm',
-                              input=output_from(epiccount),
-                              filter=suffix('.txt'),
-                              output='_norm.txt',
-                              output_dir=dir_epiccount,
-                              extras=[cmd, jobcall])
-
-    dir_epicseg = os.path.join(workdir, 'epicseg', 'segment')
-    cmd = config.get('Pipeline', 'epicseg').replace('\n', ' ')
-    epicseg = pipe.transform(task_func=sci_obj.get_jobf('in_out'),
-                             name='epicseg',
-                             input=output_from(epicnorm),
-                             filter=formatter('(?P<SAMPLE>\w+)\.counts_norm\.txt'),
-                             output=os.path.join(dir_epicseg, '{SAMPLE[0]}_segmentation.bed'),
-                             extras=[cmd, jobcall]).mkdir(dir_epicseg)
-
-    sci_obj.set_config_env(dict(config.items('MemJobConfig')), dict(config.items('EnvConfigMacs')))
-    if args.gridmode:
-        jobcall = sci_obj.ruffus_gridjob()
-    else:
-        jobcall = sci_obj.ruffus_localjob()
-
-    # perform DNase peak calling with MACS2
-    dir_callpeaks = os.path.join(workdir, 'macs2', 'peaks')
-    cmd = config.get('Pipeline', 'dnasepeak').replace('\n', ' ')
-    dnasepeak = pipe.transform(task_func=sci_obj.get_jobf('in_out'),
-                               name='dnasepeak',
-                               input=output_from(bamsample),
-                               filter=formatter('(?P<SAMPLE>01_HepG2_LiHG_DNase)\.sort\.bam'),
-                               output=os.path.join(dir_callpeaks, '{SAMPLE[0]}_peaks.narrowPeak'),
-                               extras=[cmd, jobcall]).mkdir(dir_callpeaks)
-
-    dir_convncbi = os.path.join(workdir, 'ncbi')
-    convncbi = pipe.transform(task_func=convert_to_ncbi,
-                              name='convncbi',
-                              input=output_from(epicseg, nuccall),
-                              filter=suffix('.bed'),
-                              output='.ncbi.bed',
-                              output_dir=dir_convncbi).mkdir(dir_convncbi)
-
-    run_k122enh = pipe.merge(task_func=touch_checkfile,
-                             name='run_k122enh',
-                             input=output_from(rawdata_init, bamfilter, bammerge,
-                                               bamidx, nucfit, nucparams, nuccall,
-                                               epiccount, epicnorm, epicseg,
-                                               convncbi, cleangenome, countreads,
-                                               countmerged, dnasepeak),
-                             output=os.path.join(workdir, 'run_project_k122enh.chk'))
+    # cmd = config.get('Pipeline', 'cleangenome')
+    # cleangenome = pipe.transform(task_func=sci_obj.get_jobf('in_out'),
+    #                              name='cleangenome',
+    #                              input=config.get('Refdata', 'chromreg'),
+    #                              filter=formatter(),
+    #                              output=config.get('Refdata', 'cleanreg'),
+    #                              extras=[cmd, jobcall]).follows(rawdata_init)
+    #
+    # dir_filtered = os.path.join(workdir, 'filtered')
+    # cmd = config.get('Pipeline', 'bamfilt')
+    # bamfilter = pipe.transform(task_func=sci_obj.get_jobf('in_out'),
+    #                            name='bamfilter',
+    #                            input=output_from(rawdata_init),
+    #                            filter=suffix('.bam'),
+    #                            output='.filt.bam',
+    #                            output_dir=dir_filtered,
+    #                            extras=[cmd, jobcall]).mkdir(dir_filtered).follows(cleangenome)
+    #
+    # cmd = config.get('Pipeline', 'countreads')
+    # countreads = pipe.transform(task_func=sci_obj.get_jobf('in_out'),
+    #                             name='countreads',
+    #                             input=output_from(bamfilter),
+    #                             filter=suffix('.filt.bam'),
+    #                             output='.filt.cnt',
+    #                             output_dir=dir_filtered,
+    #                             extras=[cmd, jobcall])
+    #
+    # sci_obj.set_config_env(dict(config.items('ParallelJobConfig')), dict(config.items('EnvConfig')))
+    # if args.gridmode:
+    #     jobcall = sci_obj.ruffus_gridjob()
+    # else:
+    #     jobcall = sci_obj.ruffus_localjob()
+    #
+    # # 01_HepG2_LiHG_Ct1_Input_S_1.bwa.20150122.filt.bam
+    # # 01_HepG2_LiHG_Ct1_Input_S_2.bwa.20150120.filt.bam
+    # dir_bammerge = os.path.join(workdir, 'merged')
+    # cmd = config.get('Pipeline', 'bammerge')
+    # bammerge = pipe.collate(task_func=sci_obj.get_jobf('ins_out'),
+    #                         name='bammerge',
+    #                         input=output_from(bamfilter),
+    #                         filter=formatter('(?P<BIOSAMPLE>\w+)_(?P<REP>Ct[0-9])_(?P<MARK>\w+)_(?P<CENTER>(S|F)_(1|2)).+\.filt\.bam'),
+    #                         output=os.path.join(dir_bammerge, '{BIOSAMPLE[0]}_{MARK[0]}.mrg.bam'),
+    #                         extras=[cmd, jobcall]).mkdir(dir_bammerge)
+    #
+    # sci_obj.set_config_env(dict(config.items('JobConfig')), dict(config.items('EnvConfig')))
+    # if args.gridmode:
+    #     jobcall = sci_obj.ruffus_gridjob()
+    # else:
+    #     jobcall = sci_obj.ruffus_localjob()
+    #
+    # cmd = config.get('Pipeline', 'countreads')
+    # countmerged = pipe.transform(task_func=sci_obj.get_jobf('in_out'),
+    #                              name='countmerged',
+    #                              input=output_from(bammerge),
+    #                              filter=suffix('.mrg.bam'),
+    #                              output='.mrg.cnt',
+    #                              output_dir=dir_bammerge,
+    #                              extras=[cmd, jobcall])
+    #
+    # sci_obj.set_config_env(dict(config.items('JobConfig')), dict(config.items('EnvConfig')))
+    # if args.gridmode:
+    #     jobcall = sci_obj.ruffus_gridjob()
+    # else:
+    #     jobcall = sci_obj.ruffus_localjob()
+    #
+    # cmd = config.get('Pipeline', 'bamidx')
+    # bamidx = pipe.transform(task_func=sci_obj.get_jobf('in_out'),
+    #                         name='bamidx',
+    #                         input=output_from(bamsample),
+    #                         filter=suffix('.bam'),
+    #                         output='.bai',
+    #                         output_dir=dir_bamsample,
+    #                         extras=[cmd, jobcall])
+    #
+    # cmd = config.get('Pipeline', 'epiccount').replace('\n', ' ')
+    # dir_epiccount = os.path.join(workdir, 'epicseg', 'counts')
+    # epiccount = pipe.files(sci_obj.get_jobf('ins_out'),
+    #                        build_epiccount_arguments(collect_full_paths(dir_bamsample, '*.bam'),
+    #                                                  dir_epiccount, cmd, jobcall)).mkdir(dir_epiccount).follows(bamsample)
+    #
+    # cmd = config.get('Pipeline', 'epicnorm')
+    # epicnorm = pipe.transform(task_func=sci_obj.get_jobf('in_out'),
+    #                           name='epicnorm',
+    #                           input=output_from(epiccount),
+    #                           filter=suffix('.txt'),
+    #                           output='_norm.txt',
+    #                           output_dir=dir_epiccount,
+    #                           extras=[cmd, jobcall])
+    #
+    # dir_epicseg = os.path.join(workdir, 'epicseg', 'segment')
+    # cmd = config.get('Pipeline', 'epicseg').replace('\n', ' ')
+    # epicseg = pipe.transform(task_func=sci_obj.get_jobf('in_out'),
+    #                          name='epicseg',
+    #                          input=output_from(epicnorm),
+    #                          filter=formatter('(?P<SAMPLE>\w+)\.counts_norm\.txt'),
+    #                          output=os.path.join(dir_epicseg, '{SAMPLE[0]}_segmentation.bed'),
+    #                          extras=[cmd, jobcall]).mkdir(dir_epicseg)
+    #
+    # sci_obj.set_config_env(dict(config.items('MemJobConfig')), dict(config.items('EnvConfigMacs')))
+    # if args.gridmode:
+    #     jobcall = sci_obj.ruffus_gridjob()
+    # else:
+    #     jobcall = sci_obj.ruffus_localjob()
+    #
+    # # perform DNase peak calling with MACS2
+    # dir_callpeaks = os.path.join(workdir, 'macs2', 'peaks')
+    # cmd = config.get('Pipeline', 'dnasepeak').replace('\n', ' ')
+    # dnasepeak = pipe.transform(task_func=sci_obj.get_jobf('in_out'),
+    #                            name='dnasepeak',
+    #                            input=output_from(bamsample),
+    #                            filter=formatter('(?P<SAMPLE>01_HepG2_LiHG_DNase)\.sort\.bam'),
+    #                            output=os.path.join(dir_callpeaks, '{SAMPLE[0]}_peaks.narrowPeak'),
+    #                            extras=[cmd, jobcall]).mkdir(dir_callpeaks)
+    #
+    # run_k122enh = pipe.merge(task_func=touch_checkfile,
+    #                          name='run_k122enh',
+    #                          input=output_from(rawdata_init, bamfilter, bammerge,
+    #                                            bamidx, epiccount, epicnorm, epicseg,
+    #                                            cleangenome, countreads,
+    #                                            countmerged, dnasepeak),
+    #                          output=os.path.join(workdir, 'run_project_k122enh.chk'))
 
     return pipe
