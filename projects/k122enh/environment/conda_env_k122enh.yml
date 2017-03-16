@@ -22,6 +22,6 @@ dependencies:
   - bioconductor-iranges
   - bioconductor-edger
   - bioconductor-biocinstaller
-
+  - ucsc-bigwigtobedgraph
   # install EpiCSeg: https://github.com/lamortenera/epicseg
   # install TEPIC: https://github.com/SchulzLab/TEPIC
