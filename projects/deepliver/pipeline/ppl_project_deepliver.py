@@ -307,6 +307,21 @@ def build_pipeline(args, config, sci_obj):
     mmu_scores = mmu_scores.mkdir(dir_dnase_scores)
     mmu_scores = mmu_scores.follows(mmu_blocks)
 
+    sci_obj.set_config_env(dict(config.items('ParallelJobConfig')), dict(config.items('EnvConfig')))
+    if args.gridmode:
+        jobcall = sci_obj.ruffus_gridjob()
+    else:
+        jobcall = sci_obj.ruffus_localjob()
+
+    cmd = config.get('Pipeline', 'prep_mldata')
+    dir_ml_data = os.path.join(workdir, 'mldata')
+    prep_mldata = pipe.merge(task_func=sci_obj.get_jobf('ins_out'),
+                             name='prep_mldata',
+                             input=output_from(hsa_scores, mmu_scores),
+                             output=os.path.join(dir_ml_data, 'hg19_mm10_mldata.h5'),
+                             extras=[cmd, jobcall])
+    prep_mldata = prep_mldata.mkdir(dir_ml_data)
+
     # cmd = config.get('Pipeline', 'cleangenome')
     # cleangenome = pipe.transform(task_func=sci_obj.get_jobf('in_out'),
     #                              name='cleangenome',
