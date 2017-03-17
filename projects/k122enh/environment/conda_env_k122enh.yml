@@ -23,5 +23,6 @@ dependencies:
   - bioconductor-edger
   - bioconductor-biocinstaller
   - ucsc-bigwigtobedgraph
+  - scikit-learn=0.18.*
   # install EpiCSeg: https://github.com/lamortenera/epicseg
   # install TEPIC: https://github.com/SchulzLab/TEPIC
