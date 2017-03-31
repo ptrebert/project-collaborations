@@ -7,9 +7,11 @@ import re as re
 import shutil as sh
 import csv as csv
 import json as js
+import functools as fnt
 import statistics as stat
 import collections as col
 import io as io
+import operator as op
 
 from ruffus import *
 
@@ -193,6 +195,185 @@ def convert_to_ncbi(inputfile, outputfile):
     return outputfile
 
 
+def link_histone_data(inputdirs, outputdir):
+    """
+    :param inputdirs:
+    :param outputdir:
+    :return:
+    """
+    patterns = ['*LiHe*H3K27ac*.ba?',
+                '*LiHe*H3K4me3*.ba?',
+                '*LiHe*Input*.ba?',
+                '*HepG2*H3K27ac*.ba?',
+                '*HepG2*H3K4me3*.ba?',
+                '*HepG2*Input*.ba?',
+                '*HepaRG*H3K27ac*.ba?',
+                '*HepaRG*H3K4me3*.ba?',
+                '*HepaRG*Input*.ba?']
+    linked = []
+    for folder in inputdirs:
+        for root, subdirs, datafiles in os.walk(folder):
+            if datafiles:
+                for p in patterns:
+                    to_link = fnm.filter(datafiles, p)
+                    for l in to_link:
+                        dst = os.path.join(outputdir, l)
+                        if os.path.islink(dst):
+                            pass
+                        else:
+                            src = os.path.join(root, l)
+                            os.link(src, dst)
+                        linked.append(dst)
+    assert linked, 'No input data files linked for folders: {}'.format(inputdirs)
+    return linked
+
+
+def build_run_name(group1, group2):
+    """
+    :param group1:
+    :param group2:
+    :return:
+    """
+    map1 = dict((k, v) for k, v in zip(group1[0], group1[1]))
+    map2 = dict((k, v) for k, v in zip(group2[0], group2[1]))
+    shared = sorted(set(map1.keys()).intersection(set(map2.keys())))
+    name = ''
+    for s in shared:
+        v1 = map1[s]
+        v2 = map2[s]
+        if v1 == v2:
+            name += v1 + '_'
+        else:
+            name += v1 + '-vs-' + v2 + '_'
+    return name.strip('_')
+
+
+def generate_thor_configs(datafiles, outputfile, rawconf):
+    """
+    :param datafiles:
+    :param outputfile:
+    :param rawconf:
+    :return:
+    """
+    with open(rawconf, 'r') as raw:
+        baseconf = raw.read().strip()
+    basepath = os.path.split(outputfile)[0]
+    assert os.path.isdir(basepath), 'This is not a valid folder: {}'.format(basepath)
+    hist_attrib = group_histone_files(datafiles)
+
+    # select pattern: (my_sex, my_type, my_status, my_assay, fpath)
+    groups1 = [((0, 1, 3), ('female', 'LiHe', 'H3K4me3')),
+               ((0, 1, 3), ('female', 'LiHe', 'H3K27ac')),
+               ((0, 1, 2, 3), ('female', 'LiHe', 'Ct', 'H3K27ac')),
+               ((0, 1, 2, 3), ('female', 'LiHe', 'Ct', 'H3K4me3')),
+               ((0, 1, 2, 3), ('male', 'LiHe', 'Ct', 'H3K27ac')),
+               ((0, 1, 2, 3), ('male', 'LiHe', 'Ct', 'H3K4me3')),
+               ((0, 1, 2, 3), ('male', 'LiHe', 'Ct', 'H3K27ac')),
+               ((0, 1, 2, 3), ('male', 'LiHe', 'Ct', 'H3K4me3')),
+               ((0, 1, 2, 3), ('male', 'LiHe', 'St', 'H3K27ac')),
+               ((0, 1, 2, 3), ('male', 'LiHe', 'St', 'H3K4me3'))]
+
+    groups2 = [((0, 1, 3), ('male', 'LiHe', 'H3K4me3')),
+               ((0, 1, 3), ('male', 'LiHe', 'H3K27ac')),
+               ((0, 1, 2, 3), ('female', 'LiHe', 'St', 'H3K27ac')),
+               ((0, 1, 2, 3), ('female', 'LiHe', 'St', 'H3K4me3')),
+               ((0, 1, 2, 3), ('male', 'LiHe', 'St', 'H3K27ac')),
+               ((0, 1, 2, 3), ('male', 'LiHe', 'St', 'H3K4me3')),
+               ((0, 1, 2, 3), ('male', 'LiHG', 'Ct', 'H3K27ac')),
+               ((0, 1, 2, 3), ('male', 'LiHG', 'Ct', 'H3K4me3')),
+               ((0, 1, 2, 3), ('male', 'LiHG', 'Ct', 'H3K27ac')),
+               ((0, 1, 2, 3), ('male', 'LiHG', 'Ct', 'H3K4me3'))]
+
+    conf_files = []
+    for g1, g2 in zip(groups1, groups2):
+        reps1, inp1 = build_group(g1[0], g1[1], hist_attrib)
+        reps2, inp2 = build_group(g2[0], g2[1], hist_attrib)
+        new_conf = baseconf.format(**{'rep1_files': reps1,
+                                      'rep2_files': reps2,
+                                      'inp1_files': inp1,
+                                      'inp2_files': inp2})
+        conf_name = build_run_name(g1, g2)
+        outpath = os.path.join(basepath, conf_name + '.config')
+        with open(outpath, 'w') as dump:
+            _ = dump.write(new_conf)
+        conf_files.append(outpath)
+    assert conf_files, 'No config files created'
+    with open(outputfile, 'w') as chk:
+        _ = chk.write('Ok')
+    return conf_files
+
+
+def build_group(indices, wanted, histfiles):
+    """
+    :param indices:
+    :param wanted:
+    :param histfiles:
+    :return:
+    """
+    selector = op.itemgetter(*indices)
+    reps = []
+    inputs = []
+    inputfiles = sorted([t[-1] for t in histfiles if '_Input_' in t[-1]])
+    for hf in histfiles:
+        has = selector(hf)
+        if has == wanted:
+            inpfile = find_matching_input(hf[-1], inputfiles)
+            assert inpfile, 'Yu no input file: {}'.format(hf[-1])
+            inputs.append(inpfile)
+            reps.append(hf[-1])
+    reps = sorted(reps)
+    inputs = sorted(inputs)
+    assert reps, 'No replicates selected: {} and {}'.format(indices, wanted)
+    assert inputs, 'No inputs selected: {} and {}'.format(indices, wanted)
+    return '\n'.join(reps), '\n'.join(inputs)
+
+
+def find_matching_input(datafile, histfiles):
+    """
+    :param datafile:
+    :param histfiles:
+    :return:
+    """
+    components = os.path.basename(datafile).split('.')[0].split('_')
+    components[4] = 'Input'
+    inputfile = '_'.join(components)
+    for hf in histfiles:
+        if inputfile in hf:
+            return hf
+    return ''
+
+
+def group_histone_files(histfiles):
+    """
+    :param histfiles:
+    :return:
+    """
+    bamfiles = fnm.filter(histfiles, '*.bam')
+    hist_re = re.compile('^[0-9]+_(?P<DONOR>[A-Za-z0-9]+)_(?P<CELL>[A-Za-z0-9]+)_(?P<STATUS>[A-Za-z0-9]+)_(?P<ASSAY>[A-Za-z0-9]+)_.+')
+    sex = {'Hf': 'female', 'Hm': 'male',
+           'HepG2': 'male', 'HepaRG': 'female'}
+    status = {'Ct1': 'Ct', 'Ct2': 'Ct'}
+    annotated = []
+    for bf in bamfiles:
+        fp, fn = os.path.split(bf)
+        mobj = hist_re.match(fn)
+        assert mobj is not None, 'Could not match filename: {}'.format(fn)
+        try:
+            donor = mobj.group('DONOR')
+            if donor in sex:
+                my_sex = sex[donor]
+            else:
+                my_sex = sex[donor[:2]]
+        except KeyError:
+            raise KeyError('Could not identify sex: {} for group {}'.format(fn, mobj.group('DONOR')))
+        my_type = mobj.group('CELL')
+
+        my_status = status.get(mobj.group('STATUS'), mobj.group('STATUS'))
+        my_assay = mobj.group('ASSAY')
+        annotated.append((my_sex, my_type, my_status, my_assay, bf))
+    return annotated
+
+
 def build_pipeline(args, config, sci_obj):
     """
     :param args:
@@ -268,8 +449,8 @@ def build_pipeline(args, config, sci_obj):
 
     dir_dnase_input = os.path.join(workdir, 'input')
 
-    dnase_input = copy_input_files([config.get('DataSource', 'human'),
-                                    config.get('DataSource', 'mouse')],
+    dnase_input = copy_input_files([config.get('DataSource', 'hsa_dnase'),
+                                    config.get('DataSource', 'mmu_dnase')],
                                    dir_dnase_input)
 
     dnase_init = pipe.originate(task_func=lambda x: x,
@@ -321,6 +502,48 @@ def build_pipeline(args, config, sci_obj):
                              output=os.path.join(dir_ml_data, 'hg19_mm10_mldata.h5'),
                              extras=[cmd, jobcall])
     prep_mldata = prep_mldata.mkdir(dir_ml_data)
+
+    ###
+    # Differential analysis with THOR
+
+    hsa_hist_folder = config.get('DataSource', 'hsa_hist')
+    hsa_cell_folder = config.get('DataSource', 'cell_hist')
+    dest_folder = dir_dnase_input
+    histone_data = link_histone_data([hsa_hist_folder, hsa_cell_folder], dest_folder)
+
+    histone_init = pipe.originate(task_func=lambda x: x,
+                                  name='histone_init',
+                                  output=histone_data)
+
+    dir_thor_configs = os.path.join(workdir, 'thor_run_configs')
+    gen_thor_configs = pipe.merge(task_func=generate_thor_configs,
+                                  name='gen_thor_configs',
+                                  input=output_from(histone_init),
+                                  output=os.path.join(dir_thor_configs, 'thor_config.chk'),
+                                  extras=[config.get('Pipeline', 'thorraw')])
+    gen_thor_configs = gen_thor_configs.mkdir(dir_thor_configs)
+
+    thor_configs = collect_full_paths(dir_thor_configs, '*.config')
+    thor_cfg_init = pipe.originate(task_func=lambda x: x,
+                                   name='thor_cfg_init',
+                                   output=thor_configs)
+    thor_cfg_init = thor_cfg_init.follows(gen_thor_configs)
+
+    sci_obj.set_config_env(dict(config.items('MemJobConfig')), dict(config.items('ThorEnvConfig')))
+    if args.gridmode:
+        jobcall = sci_obj.ruffus_gridjob()
+    else:
+        jobcall = sci_obj.ruffus_localjob()
+
+    dir_diff_out = os.path.join(workdir, 'histdiff')
+    cmd = config.get('Pipeline', 'thor')
+    run_thor = pipe.transform(task_func=sci_obj.get_jobf('in_out'),
+                              name='run_thor',
+                              input=output_from(thor_cfg_init),
+                              filter=formatter('(?P<NAME>\w+)\.config'),
+                              output=os.path.join(dir_diff_out, '{NAME[0]}', '{NAME[0]}-setup.info'),
+                              extras=[cmd, jobcall])
+    run_thor = run_thor.mkdir(dir_diff_out)
 
     # cmd = config.get('Pipeline', 'cleangenome')
     # cleangenome = pipe.transform(task_func=sci_obj.get_jobf('in_out'),

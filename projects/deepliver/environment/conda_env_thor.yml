@@ -1,0 +1,17 @@
+name: thor
+channels:
+  - bioconda
+  - conda-forge
+dependencies:
+  - python=2.7
+  - numpy=1.11.0
+  - scipy
+  - scikit-learn
+  - pysam
+  - htseq
+  - hmmlearn=20151031
+  - mpmath
+  - cython
+  - pip
+  - pip:
+    - RGT
