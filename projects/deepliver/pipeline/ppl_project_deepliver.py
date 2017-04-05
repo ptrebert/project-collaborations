@@ -536,11 +536,11 @@ def build_pipeline(args, config, sci_obj):
         jobcall = sci_obj.ruffus_localjob()
 
     dir_diff_out = os.path.join(workdir, 'histdiff')
-    cmd = config.get('Pipeline', 'thor')
+    cmd = config.get('Pipeline', 'thor').replace('\n', ' ')
     run_thor = pipe.transform(task_func=sci_obj.get_jobf('in_out'),
                               name='run_thor',
                               input=output_from(thor_cfg_init),
-                              filter=formatter('(?P<NAME>\w+)\.config'),
+                              filter=formatter('(?P<NAME>[\w\-]+)\.config'),
                               output=os.path.join(dir_diff_out, '{NAME[0]}', '{NAME[0]}-setup.info'),
                               extras=[cmd, jobcall])
     run_thor = run_thor.mkdir(dir_diff_out)
