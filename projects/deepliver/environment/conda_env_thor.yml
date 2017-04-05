@@ -14,3 +14,4 @@ dependencies:
   - pip
   - pip:
     - RGT>=0.9.8
+    - PePr>=1.1.18

@@ -248,7 +248,7 @@ def build_run_name(group1, group2):
     return name.strip('_')
 
 
-def generate_thor_configs(datafiles, outputfile, rawconf):
+def generate_diffpeak_configs(datafiles, outputfile, rawconf, pepr=False, peprout=''):
     """
     :param datafiles:
     :param outputfile:
@@ -286,13 +286,28 @@ def generate_thor_configs(datafiles, outputfile, rawconf):
 
     conf_files = []
     for g1, g2 in zip(groups1, groups2):
-        reps1, inp1 = build_group(g1[0], g1[1], hist_attrib)
-        reps2, inp2 = build_group(g2[0], g2[1], hist_attrib)
-        new_conf = baseconf.format(**{'rep1_files': reps1,
-                                      'rep2_files': reps2,
-                                      'inp1_files': inp1,
-                                      'inp2_files': inp2})
         conf_name = build_run_name(g1, g2)
+        if pepr:
+            assert os.path.isdir(peprout), 'No valid base path to output dir: {}'.format(basepath)
+            reps1, inp1, dn1 = build_group(g1[0], g1[1], hist_attrib, True, '1')
+            reps2, inp2, dn2 = build_group(g2[0], g2[1], hist_attrib, True, '2')
+            dupnum = min(dn1, dn2)
+            run_out = os.path.join(peprout, conf_name)
+            os.makedirs(run_out, exist_ok=True)
+            new_conf = baseconf.format(**{'rep1_files': reps1,
+                                          'rep2_files': reps2,
+                                          'inp1_files': inp1,
+                                          'inp2_files': inp2,
+                                          'dupnum': dupnum,
+                                          'name': conf_name,
+                                          'outputdir': run_out})
+        else:
+            reps1, inp1, _ = build_group(g1[0], g1[1], hist_attrib)
+            reps2, inp2, _ = build_group(g2[0], g2[1], hist_attrib)
+            new_conf = baseconf.format(**{'rep1_files': reps1,
+                                          'rep2_files': reps2,
+                                          'inp1_files': inp1,
+                                          'inp2_files': inp2})
         outpath = os.path.join(basepath, conf_name + '.config')
         with open(outpath, 'w') as dump:
             _ = dump.write(new_conf)
@@ -303,7 +318,7 @@ def generate_thor_configs(datafiles, outputfile, rawconf):
     return conf_files
 
 
-def build_group(indices, wanted, histfiles):
+def build_group(indices, wanted, histfiles, pepr=False, group=''):
     """
     :param indices:
     :param wanted:
@@ -325,7 +340,18 @@ def build_group(indices, wanted, histfiles):
     inputs = sorted(inputs)
     assert reps, 'No replicates selected: {} and {}'.format(indices, wanted)
     assert inputs, 'No inputs selected: {} and {}'.format(indices, wanted)
-    return '\n'.join(reps), '\n'.join(inputs)
+    if pepr:
+        dn = len(reps)
+        assert int(group), 'Group has to be a number: {}'.format(group)
+        reps = ['chip' + group + ' ' + os.path.basename(fp) for fp in reps]
+        reps = '\n'.join(reps)
+        inputs = ['input' + group + ' ' + os.path.basename(fp) for fp in inputs]
+        inputs = '\n'.join(inputs)
+    else:
+        reps = '\n'.join(reps)
+        inputs = '\n'.join(inputs)
+        dn = 0
+    return reps, inputs, dn
 
 
 def find_matching_input(datafile, histfiles):
@@ -515,8 +541,8 @@ def build_pipeline(args, config, sci_obj):
                                   name='histone_init',
                                   output=histone_data)
 
-    dir_thor_configs = os.path.join(workdir, 'thor_run_configs')
-    gen_thor_configs = pipe.merge(task_func=generate_thor_configs,
+    dir_thor_configs = os.path.join(workdir, 'run_configs', 'thor')
+    gen_thor_configs = pipe.merge(task_func=generate_diffpeak_configs,
                                   name='gen_thor_configs',
                                   input=output_from(histone_init),
                                   output=os.path.join(dir_thor_configs, 'thor_config.chk'),
@@ -528,6 +554,7 @@ def build_pipeline(args, config, sci_obj):
                                    name='thor_cfg_init',
                                    output=thor_configs)
     thor_cfg_init = thor_cfg_init.follows(gen_thor_configs)
+    thor_cfg_init = thor_cfg_init.active_if(len(thor_configs) > 0)
 
     sci_obj.set_config_env(dict(config.items('MemJobConfig')), dict(config.items('ThorEnvConfig')))
     if args.gridmode:
@@ -535,15 +562,44 @@ def build_pipeline(args, config, sci_obj):
     else:
         jobcall = sci_obj.ruffus_localjob()
 
-    dir_diff_out = os.path.join(workdir, 'histdiff')
+    dir_diff_thor_out = os.path.join(workdir, 'histdiff', 'thor')
     cmd = config.get('Pipeline', 'thor').replace('\n', ' ')
     run_thor = pipe.transform(task_func=sci_obj.get_jobf('in_out'),
                               name='run_thor',
                               input=output_from(thor_cfg_init),
                               filter=formatter('(?P<NAME>[\w\-]+)\.config'),
-                              output=os.path.join(dir_diff_out, '{NAME[0]}', '{NAME[0]}-setup.info'),
+                              output=os.path.join(dir_diff_thor_out, '{NAME[0]}', '{NAME[0]}-setup.info'),
                               extras=[cmd, jobcall])
-    run_thor = run_thor.mkdir(dir_diff_out)
+    run_thor = run_thor.mkdir(dir_diff_thor_out)
+
+    # =====================
+    # run PePr
+
+    dir_diff_pepr_out = os.path.join(workdir, 'histdiff', 'pepr')
+    dir_pepr_configs = os.path.join(workdir, 'run_configs', 'pepr')
+    gen_pepr_configs = pipe.merge(task_func=generate_diffpeak_configs,
+                                  name='gen_pepr_configs',
+                                  input=output_from(histone_init),
+                                  output=os.path.join(dir_pepr_configs, 'pepr_config.chk'),
+                                  extras=[config.get('Pipeline', 'peprraw'), True, dir_diff_pepr_out])
+    gen_pepr_configs = gen_pepr_configs.mkdir(dir_pepr_configs)
+    gen_pepr_configs = gen_pepr_configs.mkdir(dir_diff_pepr_out)
+
+    pepr_configs = collect_full_paths(dir_pepr_configs, '*.config')
+    pepr_cfg_init = pipe.originate(task_func=lambda x: x,
+                                   name='pepr_cfg_init',
+                                   output=pepr_configs)
+    pepr_cfg_init = pepr_cfg_init.follows(gen_pepr_configs)
+    pepr_cfg_init = pepr_cfg_init.active_if(len(pepr_configs) > 0)
+
+    cmd = config.get('Pipeline', 'pepr').replace('\n', ' ')
+    run_pepr = pipe.transform(task_func=sci_obj.get_jobf('in_out'),
+                              name='run_pepr',
+                              input=output_from(pepr_cfg_init),
+                              filter=formatter('(?P<NAME>[\w\-]+)\.config'),
+                              output=os.path.join(dir_diff_pepr_out, '{NAME[0]}', '{NAME[0]}__PePr_peaks.bed'),
+                              extras=[cmd, jobcall])
+    run_pepr = run_thor.mkdir(dir_diff_pepr_out)
 
     # cmd = config.get('Pipeline', 'cleangenome')
     # cleangenome = pipe.transform(task_func=sci_obj.get_jobf('in_out'),
