@@ -400,6 +400,45 @@ def group_histone_files(histfiles):
     return annotated
 
 
+def make_pepr_post_calls(paramfiles, cmd, jobcall):
+    """
+    :param paramfiles:
+    :param cmd:
+    :param jobcall:
+    :return:
+    """
+    args = []
+    for param in paramfiles:
+        fp, fn = os.path.split(param)
+        outfile = os.path.join(fp, fn.replace('parameters.txt', 'postproc.chk'))
+        chips = col.defaultdict(list)
+        inputs = col.defaultdict(list)
+        bamdir = ''
+        with open(param) as infile:
+            for line in infile:
+                if line.startswith('input-directory'):
+                    bamdir = line.strip().split()[1]
+                elif line.startswith('chip'):
+                    k, v, _, _ = line.strip().split()
+                    chips[k].append(v)
+                elif line.startswith('input'):
+                    k, v, _, _ = line.strip().split()
+                    inputs[k].append(v)
+                else:
+                    continue
+        assert os.path.isdir(bamdir), 'Invalid input directory for BAM files: {}'.format(bamdir)
+        for signal, control in zip(['chip1', 'chip2'], ['input1', 'input2']):
+            peakfile = param.replace('parameters.txt', '{}_peaks.bed'.format(signal))
+            chipfiles = sorted([os.path.join(bamdir, fp) for fp in chips[signal]])
+            inputcontrols = sorted([os.path.join(bamdir, fp) for fp in inputs[control]])
+            tmp = cmd.format(**{'chipfiles': ','.join(chipfiles),
+                                'inputcontrols': ','.join(inputcontrols)})
+            args.append([peakfile, outfile, tmp, jobcall])
+    if paramfiles:
+        assert args, 'No arguments for PePr postprocessing created'
+    return args
+
+
 def build_pipeline(args, config, sci_obj):
     """
     :param args:
@@ -575,11 +614,28 @@ def build_pipeline(args, config, sci_obj):
     # =====================
     # run PePr
 
+    sci_obj.set_config_env(dict(config.items('ParallelJobConfig')), dict(config.items('ThorEnvConfig')))
+    if args.gridmode:
+        jobcall = sci_obj.ruffus_gridjob()
+    else:
+        jobcall = sci_obj.ruffus_localjob()
+
+    # PePr needs BAM files to be sorted by name
+    cmd = config.get('Pipeline', 'namesort')
+    dir_sorted_bam = os.path.join(workdir, 'input', 'sorted')
+    namesort = pipe.transform(task_func=sci_obj.get_jobf('in_out'),
+                              name='namesort',
+                              input=output_from(histone_init),
+                              filter=formatter('(?P<SAMPLE>[0-9A-Za-z_]+)[a-zA-Z0-9\.]+\.bam$'),
+                              output=os.path.join(dir_sorted_bam, '{SAMPLE[0]}.qn-srt.bam'),
+                              extras=[cmd, jobcall])
+    namesort = namesort.mkdir(dir_sorted_bam)
+
     dir_diff_pepr_out = os.path.join(workdir, 'histdiff', 'pepr')
     dir_pepr_configs = os.path.join(workdir, 'run_configs', 'pepr')
     gen_pepr_configs = pipe.merge(task_func=generate_diffpeak_configs,
                                   name='gen_pepr_configs',
-                                  input=output_from(histone_init),
+                                  input=output_from(namesort),
                                   output=os.path.join(dir_pepr_configs, 'pepr_config.chk'),
                                   extras=[config.get('Pipeline', 'peprraw'), True, dir_diff_pepr_out])
     gen_pepr_configs = gen_pepr_configs.mkdir(dir_pepr_configs)
@@ -597,9 +653,18 @@ def build_pipeline(args, config, sci_obj):
                               name='run_pepr',
                               input=output_from(pepr_cfg_init),
                               filter=formatter('(?P<NAME>[\w\-]+)\.config'),
-                              output=os.path.join(dir_diff_pepr_out, '{NAME[0]}', '{NAME[0]}__PePr_peaks.bed'),
+                              output=os.path.join(dir_diff_pepr_out, '{NAME[0]}', '{NAME[0]}__PePr_chip1_peaks.bed'),
                               extras=[cmd, jobcall])
     run_pepr = run_thor.mkdir(dir_diff_pepr_out)
+
+    cmd = config.get('Pipeline', 'pepr_post').replace('\n', ' ')
+    pepr_post_params = make_pepr_post_calls(collect_full_paths(dir_diff_pepr_out, '*__PePr_parameters.txt'),
+                                            cmd, jobcall)
+    pepr_post = pipe.files(sci_obj.get_jobf('in_out'),
+                           pepr_post_params,
+                           name='pepr_post')
+    pepr_post = pepr_post.follows(run_pepr)
+
 
     # cmd = config.get('Pipeline', 'cleangenome')
     # cleangenome = pipe.transform(task_func=sci_obj.get_jobf('in_out'),
