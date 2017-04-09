@@ -410,7 +410,6 @@ def make_pepr_post_calls(paramfiles, cmd, jobcall):
     args = []
     for param in paramfiles:
         fp, fn = os.path.split(param)
-        outfile = os.path.join(fp, fn.replace('parameters.txt', 'postproc.chk'))
         chips = col.defaultdict(list)
         inputs = col.defaultdict(list)
         bamdir = ''
@@ -431,6 +430,7 @@ def make_pepr_post_calls(paramfiles, cmd, jobcall):
             peakfile = param.replace('parameters.txt', '{}_peaks.bed'.format(signal))
             chipfiles = sorted([os.path.join(bamdir, fp) for fp in chips[signal]])
             inputcontrols = sorted([os.path.join(bamdir, fp) for fp in inputs[control]])
+            outfile = os.path.join(fp, fn.replace('parameters.txt', '{}_postproc.chk'.format(signal)))
             tmp = cmd.format(**{'chipfiles': ','.join(chipfiles),
                                 'inputcontrols': ','.join(inputcontrols)})
             args.append([peakfile, outfile, tmp, jobcall])
