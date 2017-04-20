@@ -439,6 +439,66 @@ def make_pepr_post_calls(paramfiles, cmd, jobcall):
     return args
 
 
+def normalize_pepr_output(inputfile, outputfile):
+    """
+    :param inputfile:
+    :param outputfile:
+    :return:
+    """
+    # PePr output is in broadPeak format
+    header = ['#chrom', 'start', 'end', 'name', 'score', 'strand', 'signalValue', 'pValue', 'qValue']
+    if 'chip1_postproc.chk' in inputfile:
+        peakfile = inputfile.replace('chip1_postproc.chk', 'chip1_peaks.bed.passed.boundary_refined')
+    else:
+        peakfile = inputfile.replace('chip2_postproc.chk', 'chip2_peaks.bed.passed.boundary_refined')
+    rows = []
+    with open(peakfile, 'r', newline='') as peaks:
+        reader = csv.DictReader(peaks, fieldnames=header, delimiter='\t')
+        for entry in reader:
+            rows.append(entry)
+    rows = sorted(rows, key=lambda x: (x['#chrom'], int(x['start']), int(x['end'])))
+    with open(outputfile, 'w', newline='') as outf:
+        writer = csv.DictWriter(outf, fieldnames=header, delimiter='\t')
+        writer.writeheader()
+        writer.writerows(rows)
+    return outputfile
+
+
+def normalize_thor_output(inputfile, outputfiles):
+    """
+    :param inputfile:
+    :param outputfiles:
+    :return:
+    """
+    header = ['#chrom', 'start', 'end', 'name', 'score', 'strand', 'signalValue', 'pValue', 'qValue', 'summit']
+    cond1 = []
+    cond2 = []
+    peakfile = inputfile.replace('-setup.info', '-diffpeaks.narrowPeak')
+    assert os.path.isfile(peakfile), 'Invalid path to peak file: {}'.format(peakfile)
+    with open(peakfile, 'r', newline='') as peaks:
+        reader = csv.DictReader(peaks, delimiter='\t', fieldnames=header)
+        for entry in reader:
+            if entry['strand'] == '+':
+                entry['strand'] = '.'
+                cond1.append(entry)
+            elif entry['strand'] == '-':
+                entry['strand'] = '.'
+                cond2.append(entry)
+            else:
+                raise ValueError('Cannot process line: {}'.format(entry))
+    cond1 = sorted(cond1, key=lambda x: (x['#chrom'], int(x['start']), int(x['end'])))
+    cond2 = sorted(cond2, key=lambda x: (x['#chrom'], int(x['start']), int(x['end'])))
+    with open(outputfiles[0], 'w', newline='') as peaks1:
+        writer = csv.DictWriter(peaks1, fieldnames=header, delimiter='\t')
+        writer.writeheader()
+        writer.writerows(cond1)
+    with open(outputfiles[1], 'w', newline='') as peaks2:
+        writer = csv.DictWriter(peaks2, fieldnames=header, delimiter='\t')
+        writer.writeheader()
+        writer.writerows(cond2)
+    return outputfiles
+
+
 def build_pipeline(args, config, sci_obj):
     """
     :param args:
@@ -611,6 +671,14 @@ def build_pipeline(args, config, sci_obj):
                               extras=[cmd, jobcall])
     run_thor = run_thor.mkdir(dir_diff_thor_out)
 
+    thor_norm = pipe.subdivide(task_func=normalize_thor_output,
+                               name='thor_norm',
+                               input=output_from(run_thor),
+                               filter=formatter('.+/(?P<NAME>[\w\-]+)-setup.info'),
+                               output=['{path[0]}/{NAME[0]}_thor_pk-chip1.npk-fmt.bed',
+                                       '{path[0]}/{NAME[0]}_thor_pk-chip2.npk-fmt.bed'])
+    thor_norm = thor_norm.jobs_limit(4)
+
     # =====================
     # run PePr
 
@@ -665,6 +733,74 @@ def build_pipeline(args, config, sci_obj):
                            name='pepr_post')
     pepr_post = pepr_post.follows(run_pepr)
 
+    pepr_norm = pipe.transform(task_func=normalize_pepr_output,
+                               name='pepr_norm',
+                               input=output_from(pepr_post),
+                               filter=formatter('.+/(?P<NAME>[\w\-]+)__PePr_(?P<COND>chip(1|2))_postproc.chk'),
+                               output='{path[0]}/{NAME[0]}_pepr_pk-{COND[0]}.bpk-fmt.bed')
+    pepr_norm = pepr_norm.jobs_limit(4)
+
+    sci_obj.set_config_env(dict(config.items('JobConfig')), dict(config.items('EnvConfig')))
+    if args.gridmode:
+        jobcall = sci_obj.ruffus_gridjob()
+    else:
+        jobcall = sci_obj.ruffus_localjob()
+
+    norm_re = '(?P<NAME>[\w\-]+)_(?P<TOOL>(pepr|thor))_(?P<COND>pk-chip(1|2))\.(?P<FORMAT>(bpk|npk)-fmt)\.bed'
+    cmd = config.get('Pipeline', 'select_pepr').replace('\n', ' ')
+    dir_shared_peaks = os.path.join(workdir, 'diffpeaks')
+    select_pepr = pipe.transform(task_func=sci_obj.get_jobf('in_out'),
+                                 name='select_pepr',
+                                 input=output_from(pepr_norm),
+                                 filter=formatter(norm_re),
+                                 output=os.path.join(dir_shared_peaks, '{NAME[0]}_{TOOL[0]}_{COND[0]}.shared.bed'),
+                                 extras=[cmd, jobcall])
+    select_pepr = select_pepr.mkdir(dir_shared_peaks)
+
+    cmd = config.get('Pipeline', 'select_thor').replace('\n', ' ')
+    select_thor = pipe.transform(task_func=sci_obj.get_jobf('in_out'),
+                                 name='select_thor',
+                                 input=output_from(thor_norm),
+                                 filter=formatter(norm_re),
+                                 output=os.path.join(dir_shared_peaks, '{NAME[0]}_{TOOL[0]}_{COND[0]}.shared.bed'),
+                                 extras=[cmd, jobcall])
+    select_thor = select_thor.mkdir(dir_shared_peaks)
+
+    norm_shared_re = '(?P<NAME>[\w\-]+)_(?P<TOOL>(pepr|thor))_(?P<COND>pk-chip(1|2))\.shared\.bed'
+    cmd = config.get('Pipeline', 'merge_pkfiles').replace('\n', ' ')
+    merge_pkfiles = pipe.collate(task_func=sci_obj.get_jobf('ins_out'),
+                                 name='merge_pkfiles',
+                                 input=output_from(select_pepr, select_thor),
+                                 filter=formatter(norm_shared_re),
+                                 output=os.path.join(dir_shared_peaks, '{NAME[0]}_merged_{COND[0]}.bed'),
+                                 extras=[cmd, jobcall])
+
+    merged_re1 = '(?P<NAME>[\w\-]+)_merged_(?P<COND>pk-chip1)\.bed'
+    cmd = config.get('Pipeline', 'mkuniq1')
+    mkuniq1 = pipe.transform(task_func=sci_obj.get_jobf('in_out'),
+                             name='mkuniq1',
+                             input=output_from(merge_pkfiles),
+                             filter=formatter(merged_re1),
+                             output=os.path.join(dir_shared_peaks, '{NAME[0]}_{COND[0]}_uniq.bed'),
+                             extras=[cmd, jobcall])
+
+    merged_re2 = '(?P<NAME>[\w\-]+)_merged_(?P<COND>pk-chip2)\.bed'
+    cmd = config.get('Pipeline', 'mkuniq2')
+    mkuniq2 = pipe.transform(task_func=sci_obj.get_jobf('in_out'),
+                             name='mkuniq2',
+                             input=output_from(merge_pkfiles),
+                             filter=formatter(merged_re2),
+                             output=os.path.join(dir_shared_peaks, '{NAME[0]}_{COND[0]}_uniq.bed'),
+                             extras=[cmd, jobcall])
+
+    cmd = config.get('Pipeline', 'close_genes').replace('\n', ' ')
+    close_genes = pipe.transform(task_func=sci_obj.get_jobf('in_out'),
+                                 name='close_genes',
+                                 input=output_from(mkuniq1, mkuniq2),
+                                 filter=suffix('.bed'),
+                                 output='.genes.tsv',
+                                 output_dir=dir_shared_peaks,
+                                 extras=[cmd, jobcall])
 
     # cmd = config.get('Pipeline', 'cleangenome')
     # cleangenome = pipe.transform(task_func=sci_obj.get_jobf('in_out'),
