@@ -499,6 +499,79 @@ def normalize_thor_output(inputfile, outputfiles):
     return outputfiles
 
 
+def check_diff_genes(diffpeak, outputfile, diffgenes, condition):
+    """
+    :param diffpeak:
+    :param outputfile:
+    :param diffgenes:
+    :param condition:
+    :return:
+    """
+
+    genes_in_data = dict()
+    with open(diffgenes, 'r') as genefile:
+        header = genefile.readline().strip().split()
+        for line in genefile:
+            if not line.strip():
+                continue
+            vals = line.strip().split()
+            row = dict((k, v) for k, v in zip(header, vals))
+            genes_in_data[row['symbol']] = row
+    peak_header = ['peak_chrom', 'peak_start', 'peak_end', 'peak_name',
+                   'gene_chrom', 'gene_start', 'gene_end', 'symbol', 'peak_gene_dist']
+    output = []
+    with open(diffpeak, 'r', newline='') as peakfile:
+        rows = csv.DictReader(peakfile, fieldnames=peak_header, delimiter='\t')
+        for r in rows:
+            if r['symbol'] in genes_in_data:
+                gene = genes_in_data[r['symbol']]
+                out = {'#chrom': r['gene_chrom'], 'start': r['gene_start'], 'end': r['gene_end'],
+                       'name': gene['symbol'], 'gene_id': gene['gene_id'], 'pv_adj': gene['padj'],
+                       'log2FC': gene['log2FoldChange'], 'baseMean': gene['baseMean'],
+                       'condition': condition, 'peak_start': r['peak_start'], 'peak_end': r['peak_end'],
+                       'peak_name': r['peak_name'], 'gene_peak_dist': r['peak_gene_dist']}
+                output.append(out)
+    output = sorted(output, key=lambda x: abs(float(x['log2FC'])), reverse=True)
+    out_header = ['#chrom', 'start', 'end', 'name', 'gene_id',
+                  'log2FC', 'pv_adj', 'baseMean', 'peak_start', 'peak_end',
+                  'gene_peak_dist', 'condition', 'peak_name']
+    with open(outputfile, 'w', newline='') as outf:
+        writer = csv.DictWriter(outf, fieldnames=out_header, delimiter='\t')
+        writer.writeheader()
+        writer.writerows(output)
+    return outputfile
+
+
+def aggregate_degene_marks(inputfiles, outputfile):
+    """
+    :param inputfiles:
+    :param outputfile:
+    :return:
+    """
+    stats = dict()
+    mark_counts = col.defaultdict(col.Counter)
+    all_conditions = set()
+    for fp in inputfiles:
+        with open(fp, 'r', newline='') as defile:
+            header = defile.readline().strip().split()
+            rows = csv.DictReader(defile, delimiter='\t', fieldnames=header)
+            for r in rows:
+                stats[r['gene_id']] = {'name': r['name'], 'gene_id': r['gene_id'],
+                                       '#chrom': r['#chrom'], 'start': r['start'], 'end': r['end']}
+                mark_counts[r['gene_id']][r['condition']] += 1
+                all_conditions.add(r['condition'])
+    out_header = ['#chrom', 'start', 'end', 'name', 'gene_id']
+    out_header = out_header + sorted(all_conditions)
+    for k, loc in stats.items():
+        marking = mark_counts[k]
+        loc.update(marking)
+    with open(outputfile, 'w', newline='') as outf:
+        writer = csv.DictWriter(outf, delimiter='\t', restval=0, fieldnames=out_header)
+        writer.writeheader()
+        writer.writerows(sorted(stats.values(), key=lambda x: x['name']))
+    return outputfile
+
+
 def build_pipeline(args, config, sci_obj):
     """
     :param args:
@@ -801,6 +874,32 @@ def build_pipeline(args, config, sci_obj):
                                  output='.genes.tsv',
                                  output_dir=dir_shared_peaks,
                                  extras=[cmd, jobcall])
+
+    dir_diffgenes = os.path.join(workdir, 'diffgenes')
+    file_diffgene_male = os.path.join(dir_diffgenes, '41H_mRNA_male_Ct_vs_St_all_genes_lt_05.txt')
+    diffgene_male = pipe.transform(task_func=check_diff_genes,
+                                   name='diffgene_male',
+                                   input=output_from(close_genes),
+                                   filter=formatter('.+/(?P<CONDITION>male_LiHe_Ct-vs-St_[\w\-]+)_uniq.genes.tsv'),
+                                   output=os.path.join(dir_diffgenes, '{CONDITION[0]}_de-genes.tsv'),
+                                   extras=[file_diffgene_male, '{CONDITION[0]}'])
+    diffgene_male = diffgene_male.mkdir(dir_diffgenes)
+    diffgene_male = diffgene_male.active_if(os.path.isfile(file_diffgene_male))
+
+    file_diffgene_female = os.path.join(dir_diffgenes, '41H_mRNA_female_Ct_vs_St_all_genes_lt_05.txt')
+    diffgene_female = pipe.transform(task_func=check_diff_genes,
+                                     name='diffgene_female',
+                                     input=output_from(close_genes),
+                                     filter=formatter('.+/(?P<CONDITION>female_LiHe_Ct-vs-St_[\w\-]+)_uniq.genes.tsv'),
+                                     output=os.path.join(dir_diffgenes, '{CONDITION[0]}_de-genes.tsv'),
+                                     extras=[file_diffgene_female, '{CONDITION[0]}'])
+    diffgene_female = diffgene_female.mkdir(dir_diffgenes)
+    diffgene_female = diffgene_female.active_if(os.path.isfile(file_diffgene_female))
+
+    merge_degenes = pipe.merge(task_func=aggregate_degene_marks,
+                               name='merge_degenes',
+                               input=output_from(diffgene_male, diffgene_female),
+                               output=os.path.join(dir_diffgenes, 'DE_DM_genes_LiHe_Ct-vs-St.tsv'))
 
     # cmd = config.get('Pipeline', 'cleangenome')
     # cleangenome = pipe.transform(task_func=sci_obj.get_jobf('in_out'),
